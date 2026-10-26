@@ -10,9 +10,44 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS configuration - allow frontend domain
-const corsOrigin = process.env.CORS_ORIGIN || '*';
-app.use(cors({ origin: corsOrigin, methods: ['GET', 'POST'] }));
+// CORS configuration - allow frontend domain(s)
+// CORS_ORIGIN may be a single origin, a comma-separated list, or '*'
+const rawCorsOrigin = process.env.CORS_ORIGIN || '*';
+const configuredOrigins = rawCorsOrigin === '*'
+  ? ['*']
+  : rawCorsOrigin.split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+
+const isOriginAllowed = (origin) => {
+  if (!origin) return true; // allow non-browser requests (curl, server-to-server)
+  if (configuredOrigins.includes('*')) return true;
+  const normalized = origin.replace(/\/+$/, '');
+  if (configuredOrigins.includes(normalized)) return true;
+  // Always allow local development origins (localhost or 127.0.0.1 on any port)
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(normalized)) {
+    return true;
+  }
+  // Always allow Vercel production and preview deployments
+  if (/^https:\/\/([a-z0-9-]+\.)?vercel\.app$/.test(normalized) || normalized === 'https://my-portfolio-five-smoky-50.vercel.app') {
+    return true;
+  }
+  return false;
+};
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, false);
+    }
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Parse JSON and URL‑encoded bodies
 app.use(express.json());
@@ -71,8 +106,34 @@ app.post('/api/contact', async (req, res) => {
     return res.status(500).json({ error: 'Email service not configured. Please set RESEND_API_KEY.' });
   }
   const resend = new Resend(process.env.RESEND_API_KEY);
-  const from = process.env.RESEND_FROM || `Portfolio <${process.env.RESEND_FROM_EMAIL || 'no-reply@example.com'}>`;
-  const to = process.env.CONTACT_RECIPIENT || process.env.RESEND_FROM_EMAIL || 'no-reply@example.com';
+
+  // Determine a verified sender address.
+  // Priority: RESEND_FROM (full "Name <addr>" string with a real domain) →
+  //           RESEND_FROM_EMAIL (e.g. onboarding@resend.dev, free-tier verified sender)
+  // If RESEND_FROM is set but its address part is a placeholder domain, fall back to RESEND_FROM_EMAIL.
+  const resendFromRaw  = (process.env.RESEND_FROM  || '').trim();
+  const resendFromEmail = (process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
+  let from;
+  if (resendFromRaw) {
+    // Extract the email address from a "Display Name <addr>" string, or treat the whole value as an address.
+    const angleMatch = resendFromRaw.match(/<([^>]+)>/);
+    const addrPart = angleMatch ? angleMatch[1] : resendFromRaw;
+    // Consider addresses using placeholder/generic domains as unverified; fall back to RESEND_FROM_EMAIL.
+    const placeholderDomains = ['example.com', 'yourdomain.com', 'youremail.com', 'your-domain.com'];
+    const addrDomain = addrPart.split('@')[1] || '';
+    if (placeholderDomains.some(d => addrDomain.toLowerCase().endsWith(d))) {
+      // RESEND_FROM has a placeholder domain — use the verified fallback address.
+      const displayName = angleMatch ? resendFromRaw.replace(angleMatch[0], '').trim().replace(/[,"]+$/g, '').trim() || 'Portfolio' : 'Portfolio';
+      from = `${displayName} <${resendFromEmail}>`;
+      console.warn(`RESEND_FROM domain "${addrDomain}" is a placeholder — using RESEND_FROM_EMAIL (${resendFromEmail}) as sender.`);
+    } else {
+      from = resendFromRaw;
+    }
+  } else {
+    from = `Portfolio <${resendFromEmail}>`;
+  }
+
+  const to = process.env.CONTACT_RECIPIENT || resendFromEmail;
 
   try {
     const { error: sendError } = await resend.emails.send({
